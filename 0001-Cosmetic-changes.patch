@@ -1,0 +1,89 @@
+From d97f45d52b21e8c548544b4007e6806a262735e8 Mon Sep 17 00:00:00 2001
+From: Alexey Osipov <simba@lerlan.ru>
+Date: Mon, 2 May 2011 21:53:23 +0700
+Subject: [PATCH 1/6] Cosmetic changes.
+
+---
+ minissdp.c  |   21 +++++++++------------
+ miniupnpd.c |    6 ------
+ 2 files changed, 9 insertions(+), 18 deletions(-)
+
+diff --git a/minissdp.c b/minissdp.c
+index cd7aa68..0363785 100644
+--- a/minissdp.c
++++ b/minissdp.c
+@@ -62,15 +62,15 @@ OpenAndConfSSDPReceiveSocket()
+ 	{
+ 		syslog(LOG_ERR, "socket(udp): %m");
+ 		return -1;
+-	}	
+-	
++	}
++
+ 	memset(&sockname, 0, sizeof(struct sockaddr_in));
+-    sockname.sin_family = AF_INET;
+-    sockname.sin_port = htons(SSDP_PORT);
++	sockname.sin_family = AF_INET;
++	sockname.sin_port = htons(SSDP_PORT);
+ 	/* NOTE : it seems it doesnt work when binding on the specific address */
+-    /*sockname.sin_addr.s_addr = inet_addr(UPNP_MCAST_ADDR);*/
+-    sockname.sin_addr.s_addr = htonl(INADDR_ANY);
+-    /*sockname.sin_addr.s_addr = inet_addr(ifaddr);*/
++	/*sockname.sin_addr.s_addr = inet_addr(UPNP_MCAST_ADDR);*/
++	sockname.sin_addr.s_addr = htonl(INADDR_ANY);
++	/*sockname.sin_addr.s_addr = inet_addr(ifaddr);*/
+ 
+ 	if(setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &j, sizeof(j)) < 0)
+ 	{
+@@ -78,12 +78,12 @@ OpenAndConfSSDPReceiveSocket()
+ 	}
+ 
+ 
+-    if(bind(s, (struct sockaddr *)&sockname, sizeof(struct sockaddr_in)) < 0)
++	if(bind(s, (struct sockaddr *)&sockname, sizeof(struct sockaddr_in)) < 0)
+ 	{
+ 		syslog(LOG_ERR, "bind(udp): %m");
+ 		close(s);
+ 		return -1;
+-    }
++	}
+ 
+ 	i = n_lan_addr;
+ 	while(i>0)
+@@ -300,9 +300,6 @@ void
+ SendSSDPNotifies2(int * sockets,
+                   unsigned short port,
+                   unsigned int lifetime)
+-/*SendSSDPNotifies2(int * sockets, struct lan_addr_s * lan_addr, int n_lan_addr,
+-                  unsigned short port,
+-                  unsigned int lifetime)*/
+ {
+ 	int i;
+ 	for(i=0; i<n_lan_addr; i++)
+diff --git a/miniupnpd.c b/miniupnpd.c
+index c8675d6..b0073da 100644
+--- a/miniupnpd.c
++++ b/miniupnpd.c
+@@ -90,10 +90,6 @@ int get_udp_dst_port (char *payload);
+ 
+ static int sudp = -1;
+ 
+-/* MAX_LAN_ADDR : maximum number of interfaces
+- * to listen to SSDP traffic */
+-/*#define MAX_LAN_ADDR (4)*/
+-
+ static volatile int quitting = 0;
+ static volatile int should_send_public_address_change_notif = 0;
+ 
+@@ -472,8 +468,6 @@ set_startup_time(int sysuptime)
+ struct runtime_vars {
+ 	/* LAN IP addresses for SSDP traffic and HTTP */
+ 	/* moved to global vars */
+-	/*int n_lan_addr;*/
+-	/*struct lan_addr_s lan_addr[MAX_LAN_ADDR];*/
+ 	int port;	/* HTTP Port */
+ 	int notify_interval;	/* seconds between SSDP announces */
+ 	/* unused rules cleaning related variables : */
+-- 
+1.7.0.4
+

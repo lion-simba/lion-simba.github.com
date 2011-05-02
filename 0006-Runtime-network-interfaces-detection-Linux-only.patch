@@ -1,0 +1,524 @@
+From 167b17b41a6497bce094e8afd56a74d47e130f02 Mon Sep 17 00:00:00 2001
+From: Alexey Osipov <simba@lerlan.ru>
+Date: Mon, 2 May 2011 22:42:21 +0700
+Subject: [PATCH 6/6] Runtime network interfaces detection (Linux only).
+
+---
+ Makefile.linux       |    3 +-
+ genconfig.sh         |    1 +
+ linux/ifacewatcher.c |  271 ++++++++++++++++++++++++++++++++++++++++++++++++++
+ linux/ifacewatcher.h |   45 ++++++++
+ minissdp.c           |   24 ++++-
+ minissdp.h           |    5 +-
+ miniupnpd.c          |   28 +++++
+ 7 files changed, 369 insertions(+), 8 deletions(-)
+ create mode 100644 linux/ifacewatcher.c
+ create mode 100644 linux/ifacewatcher.h
+
+diff --git a/Makefile.linux b/Makefile.linux
+index ce6e842..adf00a9 100644
+--- a/Makefile.linux
++++ b/Makefile.linux
+@@ -34,7 +34,7 @@ BASEOBJS = miniupnpd.o upnphttp.o upnpdescgen.o upnpsoap.o \
+            options.o upnppermissions.o minissdp.o natpmp.o \
+            upnpevents.o
+ 
+-LNXOBJS = linux/getifstats.o
++LNXOBJS = linux/getifstats.o linux/ifacewatcher.o
+ NETFILTEROBJS = netfilter/iptcrdr.o
+ 
+ ALLOBJS = $(BASEOBJS) $(LNXOBJS) $(NETFILTEROBJS)
+@@ -172,3 +172,4 @@ testupnpdescgen.o: config.h upnpdescgen.h
+ upnpdescgen.o: config.h upnpdescgen.h miniupnpdpath.h upnpglobalvars.h
+ upnpdescgen.o: upnppermissions.h miniupnpdtypes.h upnpdescstrings.h
+ testgetifstats.o: getifstats.h
++linux/ifacewatcher.o: linux/ifacewatcher.h minissdp.h getifaddr.h upnpglobalvars.h
+diff --git a/genconfig.sh b/genconfig.sh
+index d35009e..50e0816 100755
+--- a/genconfig.sh
++++ b/genconfig.sh
+@@ -180,6 +180,7 @@ case $OS_NAME in
+ 			esac
+ 		fi
+ 		echo "#define USE_NETFILTER 1" >> ${CONFIGFILE}
++		echo "#define USE_IFACEWATCHER 1" >> ${CONFIGFILE}
+ 		FW=netfilter
+ 		;;
+ 	OpenWRT)
+diff --git a/linux/ifacewatcher.c b/linux/ifacewatcher.c
+new file mode 100644
+index 0000000..5b92fc7
+--- /dev/null
++++ b/linux/ifacewatcher.c
+@@ -0,0 +1,271 @@
++/* MiniUPnP project
++ * http://miniupnp.free.fr/ or http://miniupnp.tuxfamily.org/
++ * (c) 2006-2009 Thomas Bernard
++ *
++ * ifacewatcher.c
++ *
++ * This file implements dynamic serving of new network interfaces
++ * which weren't available during daemon start. It also takes care
++ * of interfaces which become unavailable.
++ *
++ * Copyright (c) 2011, Alexey Osipov <simba@lerlan.ru> 
++ * All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions are met:
++ *
++ *    * Redistributions of source code must retain the above copyright notice,
++ *      this list of conditions and the following disclaimer.
++ *    * Redistributions in binary form must reproduce the above copyright notice,
++ *      this list of conditions and the following disclaimer in the documentation
++ *      and/or other materials provided with the distribution.
++ *    * The name of the author may not be used to endorse or promote products
++ *      derived from this software without specific prior written permission.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
++ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
++ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
++ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
++ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
++ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
++ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
++ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
++ * POSSIBILITY OF SUCH DAMAGE. */
++
++
++#include <sys/types.h>
++#include <sys/socket.h>
++#include <linux/netlink.h>
++#include <linux/rtnetlink.h>
++#include <arpa/inet.h>
++#include <syslog.h>
++#include <string.h>
++#include <unistd.h>
++#include <stdlib.h>
++
++#include "../config.h"
++
++#ifdef USE_IFACEWATCHER
++
++#include "ifacewatcher.h"
++#include "../minissdp.h"
++#include "../getifaddr.h"
++#include "../upnpglobalvars.h"
++#include "../natpmp.h"
++
++static int sudp = -1;
++
++int
++OpenAndConfInterfaceWatchSocket(int _sudp)
++{
++	int s;
++	struct sockaddr_nl addr;
++
++	s = socket(PF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
++	if (s == -1)
++	{
++		syslog(LOG_ERR, "socket(PF_NETLINK, SOCK_RAW, NETLINK_ROUTE): %m");
++		return -1;
++	}
++
++	memset(&addr, 0, sizeof(addr));
++	addr.nl_family = AF_NETLINK;
++	addr.nl_groups = RTMGRP_LINK;
++
++	if (bind(s, (struct sockaddr *)&addr, sizeof(addr)) < 0)
++	{
++		syslog(LOG_ERR, "bind(s, (struct sockaddr *)&addr, sizeof(addr)): %m");
++		close(s);
++		return -1;
++	}
++
++	sudp = _sudp;
++
++	return s;
++}
++
++int
++ProcessInterfaceUp(struct ifinfomsg *ifi)
++{
++	struct lan_iface_s * lan_iface;
++	struct lan_iface_s * lan_iface2;
++	struct lan_addr_s * lan_addr;
++	char ifname[IFNAMSIZ];
++	char ifstraddr[16];
++	struct in_addr ifaddr;
++
++	/* check if we already have this iface */
++	for(lan_iface = lan_ifaces.lh_first; lan_iface != NULL; lan_iface = lan_iface->list.le_next)
++		if (lan_iface->iface.index == ifi->ifi_index)
++			break;
++
++	if (lan_iface != NULL)
++		return 0;
++
++	if (if_indextoname(ifi->ifi_index, ifname) == NULL)
++	{
++		syslog(LOG_ERR, "if_indextoname(%d, ifname) failed", ifi->ifi_index);
++		return -1;
++	}
++
++	if (getifaddr(ifname, ifstraddr, 16) < 0)
++	{
++		syslog(LOG_DEBUG, "getifaddr(%s, ifaddr, 16) failed", ifname);
++		return 1;
++	}
++
++	if (inet_pton(AF_INET, ifstraddr, &ifaddr) != 1)
++	{
++		syslog(LOG_ERR, "inet_pton(AF_INET, \"%s\", &ifaddr) failed", ifstraddr);
++		return -1;
++	}
++
++	/* check if this new interface has address which we need to listen to */
++	for(lan_addr = lan_addrs.lh_first; lan_addr != NULL; lan_addr = lan_addr->list.le_next)
++	{
++		if (lan_addr->addr.s_addr != ifaddr.s_addr)
++			continue;
++
++		syslog(LOG_INFO, "Interface up: %s (%s)", ifname, ifstraddr);
++
++		/* adding new lan_iface entry */
++		lan_iface = (struct lan_iface_s *) malloc(sizeof(struct lan_iface_s));
++		if (lan_iface == NULL)
++		{
++			syslog(LOG_ERR, "malloc(sizeof(struct lan_iface_s): %m");
++			continue;
++		}
++
++		lan_iface->lan_addr = lan_addr;
++		strncpy(lan_iface->iface.name, ifname, IFNAMSIZ);
++		lan_iface->iface.index = ifi->ifi_index;
++		lan_iface->iface.addr = ifaddr;
++		lan_iface->snotify = -1;
++#ifdef ENABLE_NATPMP
++		lan_iface->snatpmp = -1;
++#endif
++
++		LIST_INSERT_HEAD(&lan_ifaces, lan_iface, list);
++
++		/* adding multicast membership for SSDP */
++		if(AddMulticastMembership(sudp, ifaddr.s_addr, ifi->ifi_index) < 0)
++			syslog(LOG_WARNING, "Failed to add multicast membership for interface %s (%s)", ifname, ifstraddr);
++		else
++			syslog(LOG_INFO, "Multicast membership added for %s (%s)", ifname, ifstraddr);
++
++		/* create SSDP notify socket */
++		if (OpenAndConfSSDPNotifySocket(lan_iface) < 0)
++			syslog(LOG_WARNING, "Failed to open SSDP notify socket for interface %s (%s)", ifname, ifstraddr);
++
++#ifdef ENABLE_NATPMP
++		/* create NAT-PMP socket */
++		for(lan_iface2 = lan_ifaces.lh_first; lan_iface2 != NULL; lan_iface2 = lan_iface2->list.le_next)
++			if (lan_iface2->lan_addr->addr.s_addr == lan_iface->lan_addr->addr.s_addr &&
++			    lan_iface2->snatpmp >= 0)
++				lan_iface->snatpmp = lan_iface2->snatpmp;
++
++		if (lan_iface->snatpmp < 0)
++		{
++			lan_iface->snatpmp = OpenAndConfNATPMPSocket(ifaddr.s_addr);
++			if (lan_iface->snatpmp < 0)
++				syslog(LOG_ERR, "OpenAndConfNATPMPSocket(ifaddr.s_addr) failed for %s (%s)", ifname, ifstraddr);
++			else
++				syslog(LOG_INFO, "Listening for NAT-PMP connection on %s:%d", ifstraddr, NATPMP_PORT);
++		}
++#endif
++	}
++
++	return 0;
++}
++
++int
++ProcessInterfaceDown(struct ifinfomsg *ifi)
++{
++	struct lan_iface_s * lan_iface;
++	struct lan_iface_s * lan_iface2;
++
++	/* check if we have this iface */
++	for(lan_iface = lan_ifaces.lh_first; lan_iface != NULL; lan_iface = lan_iface->list.le_next)
++		if (lan_iface->iface.index == ifi->ifi_index)
++			break;
++
++	if (lan_iface == NULL)
++		return 0;
++
++	/* one of our interfaces is going down, clean up */
++	syslog(LOG_INFO, "Interface down: %s", lan_iface->iface.name);
++
++	/* remove multicast membership for SSDP */
++	if(DropMulticastMembership(sudp, lan_iface->lan_addr->addr.s_addr, lan_iface->iface.index) < 0)
++		syslog(LOG_WARNING, "Failed to drop multicast membership for interface %s (%s)", lan_iface->iface.name, lan_iface->lan_addr->str);
++	else
++		syslog(LOG_INFO, "Multicast membership dropped for %s (%s)", lan_iface->iface.name, lan_iface->lan_addr->str);
++
++	/* closing SSDP notify socket */
++	close(lan_iface->snotify);
++
++#ifdef ENABLE_NATPMP
++	/* closing NAT-PMP socket if it's not used anymore */
++	for(lan_iface2 = lan_ifaces.lh_first; lan_iface2 != NULL; lan_iface2 = lan_iface2->list.le_next)
++		if (lan_iface2 != lan_iface && lan_iface2->snatpmp == lan_iface->snatpmp)
++			break;
++
++	if (lan_iface2 == NULL)
++		close(lan_iface->snatpmp);
++#endif
++
++	/* del corresponding lan_iface entry */
++	LIST_REMOVE(lan_iface, list);
++	free(lan_iface);
++
++	return 0;
++}
++
++void
++ProcessInterfaceWatchNotify(int s)
++{
++	char buffer[4096];
++	struct iovec iov;
++	struct msghdr hdr;
++	struct nlmsghdr *nlhdr;
++	struct ifinfomsg *ifi;
++	int len;
++
++	iov.iov_base = buffer;
++	iov.iov_len = sizeof(buffer);
++
++	memset(&hdr, 0, sizeof(hdr));
++	hdr.msg_iov = &iov;
++	hdr.msg_iovlen = 1;
++
++	len = recvmsg(s, &hdr, 0);
++	if (len < 0)
++	{
++		syslog(LOG_ERR, "recvmsg(s, &hdr, 0): %m");
++		return;
++	}
++
++	for (nlhdr = (struct nlmsghdr *) buffer; NLMSG_OK (nlhdr, len); nlhdr = NLMSG_NEXT (nlhdr, len))
++	{
++		if (nlhdr->nlmsg_type == NLMSG_DONE)
++			break;
++
++		if (nlhdr->nlmsg_type == RTM_DELLINK)
++		{
++			ifi = (struct ifinfomsg *) NLMSG_DATA(nlhdr);
++			if (ProcessInterfaceDown(ifi) < 0)
++				syslog(LOG_ERR, "ProcessInterfaceDown(ifi) failed");
++		}
++		else if (nlhdr->nlmsg_type == RTM_NEWLINK)
++		{
++			ifi = (struct ifinfomsg *) NLMSG_DATA(nlhdr);
++			if (ProcessInterfaceUp(ifi) < 0)
++				syslog(LOG_ERR, "ProcessInterfaceUp(ifi) failed");
++		}
++	}
++
++}
++
++#endif
+diff --git a/linux/ifacewatcher.h b/linux/ifacewatcher.h
+new file mode 100644
+index 0000000..ed5e84f
+--- /dev/null
++++ b/linux/ifacewatcher.h
+@@ -0,0 +1,45 @@
++/* MiniUPnP project
++ * http://miniupnp.free.fr/ or http://miniupnp.tuxfamily.org/
++ * (c) 2006-2009 Thomas Bernard
++ *
++ * ifacewatcher.h
++ *
++ * This file implements dynamic serving of new network interfaces
++ * which weren't available during daemon start. It also takes care
++ * of interfaces which become unavailable.
++ *
++ * Copyright (c) 2011, Alexey Osipov <simba@lerlan.ru> 
++ * All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions are met:
++ *
++ *    * Redistributions of source code must retain the above copyright notice,
++ *      this list of conditions and the following disclaimer.
++ *    * Redistributions in binary form must reproduce the above copyright notice,
++ *      this list of conditions and the following disclaimer in the documentation
++ *      and/or other materials provided with the distribution.
++ *    * The name of the author may not be used to endorse or promote products
++ *      derived from this software without specific prior written permission.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
++ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
++ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
++ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
++ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
++ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
++ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
++ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
++ * POSSIBILITY OF SUCH DAMAGE. */
++
++#ifndef __IFACEWATCHER_H__
++#define __IFACEWATCHER_H__
++
++#include "../config.h"
++
++int OpenAndConfInterfaceWatchSocket(int sudp);
++void ProcessInterfaceWatchNotify(int s);
++
++#endif
+diff --git a/minissdp.c b/minissdp.c
+index 70661b3..a58210a 100644
+--- a/minissdp.c
++++ b/minissdp.c
+@@ -30,8 +30,8 @@ void ProcessSSDPData(int s, char *bufr, struct sockaddr_in sendername, int n, un
+ 
+ #define SSDP_MCAST_ADDR ("239.255.255.250")
+ 
+-int
+-AddMulticastMembership(int s, in_addr_t ifaddr, int iface_idx)
++static int
++AddMulticastMembershipInt(int s, in_addr_t ifaddr, int iface_idx, int drop)
+ {
+ 	struct ip_mreqn imrn;
+ 	struct ip_mreq imr;
+@@ -42,9 +42,9 @@ AddMulticastMembership(int s, in_addr_t ifaddr, int iface_idx)
+ 		/* setting up imr structure */
+ 		imr.imr_multiaddr.s_addr = inet_addr(SSDP_MCAST_ADDR);
+ 		imr.imr_interface.s_addr = ifaddr;
+-		if (setsockopt(s, IPPROTO_IP, IP_ADD_MEMBERSHIP, (void *)&imr, sizeof(imr)) < 0)
++		if (setsockopt(s, IPPROTO_IP, drop ? IP_DROP_MEMBERSHIP : IP_ADD_MEMBERSHIP, (void *)&imr, sizeof(imr)) < 0)
+ 		{
+-			syslog(LOG_ERR, "setsockopt(udp, IP_ADD_MEMBERSHIP, (void *)&imr, sizeof(imr)): %m");
++			syslog(LOG_ERR, "setsockopt(udp, %s, (void *)&imr, sizeof(imr)): %m", drop ? "IP_DROP_MEMBERSHIP" : "IP_ADD_MEMBERSHIP");
+ 			return -1;
+ 		}
+ 		return 0;
+@@ -55,15 +55,27 @@ AddMulticastMembership(int s, in_addr_t ifaddr, int iface_idx)
+ 	imrn.imr_multiaddr.s_addr = inet_addr(SSDP_MCAST_ADDR);
+ 	imrn.imr_address.s_addr = ifaddr;
+ 
+-	if (setsockopt(s, IPPROTO_IP, IP_ADD_MEMBERSHIP, (void *)&imrn, sizeof(imrn)) < 0)
++	if (setsockopt(s, IPPROTO_IP, drop ? IP_DROP_MEMBERSHIP : IP_ADD_MEMBERSHIP, (void *)&imrn, sizeof(imrn)) < 0)
+ 	{
+-		syslog(LOG_ERR, "%d: setsockopt(udp, IP_ADD_MEMBERSHIP, (void *)&imrn, sizeof(imrn)): %m", imrn.imr_ifindex);
++		syslog(LOG_ERR, "%d: setsockopt(udp, %s, (void *)&imrn, sizeof(imrn)): %m", imrn.imr_ifindex, drop ? "IP_DROP_MEMBERSHIP" : "IP_ADD_MEMBERSHIP");
+ 		return -1;
+ 	}
+ 
+ 	return 0;
+ }
+ 
++int
++AddMulticastMembership(int s, in_addr_t ifaddr, int iface_idx)
++{
++	return AddMulticastMembershipInt(s, ifaddr, iface_idx, 0);
++}
++
++int
++DropMulticastMembership(int s, in_addr_t ifaddr, int iface_idx)
++{
++	return AddMulticastMembershipInt(s, ifaddr, iface_idx, 1);
++}
++
+ /* Open and configure the socket listening for 
+  * SSDP udp packets sent on 239.255.255.250 port 1900 */
+ int
+diff --git a/minissdp.h b/minissdp.h
+index 515d20e..00b2961 100644
+--- a/minissdp.h
++++ b/minissdp.h
+@@ -7,7 +7,7 @@
+ #ifndef __MINISSDP_H__
+ #define __MINISSDP_H__
+ 
+-/*#include "miniupnpdtypes.h"*/
++#include "miniupnpdtypes.h"
+ 
+ int
+ OpenAndConfSSDPReceiveSocket();
+@@ -42,5 +42,8 @@ SubmitServicesToMiniSSDPD(const char * host, unsigned short port);
+ 
+ int
+ AddMulticastMembership(int s, in_addr_t ifaddr, int iface_idx);
++
++int
++DropMulticastMembership(int s, in_addr_t ifaddr, int iface_idx);
+ #endif
+ 
+diff --git a/miniupnpd.c b/miniupnpd.c
+index be2f0da..dff9886 100644
+--- a/miniupnpd.c
++++ b/miniupnpd.c
+@@ -63,6 +63,9 @@
+ #include "natpmp.h"
+ #endif
+ #include "commonrdr.h"
++#ifdef USE_IFACEWATCHER
++#include "linux/ifacewatcher.h"
++#endif
+ 
+ #ifndef DEFAULT_CONFIG
+ #define DEFAULT_CONFIG "/etc/miniupnpd.conf"
+@@ -89,6 +92,9 @@ int get_udp_dst_port (char *payload);
+ 
+ 
+ static int sudp = -1;
++#ifdef USE_IFACEWATCHER
++static int sifacewatcher = -1;
++#endif
+ 
+ static volatile int quitting = 0;
+ static volatile int should_send_public_address_change_notif = 0;
+@@ -1188,6 +1194,16 @@ main(int argc, char * * argv)
+ 		                "messages. EXITING");
+ 			return 1;
+ 		}
++
++#ifdef USE_IFACEWATCHER
++		/* open socket for kernel notifications about new network interfaces */
++		if (sudp >= 0)
++		{
++			sifacewatcher = OpenAndConfInterfaceWatchSocket(sudp);
++			if (sifacewatcher < 0)
++				syslog(LOG_ERR, "Failed to open socket for receiving kernel notifications. Runtime SSDP interfaces adding will be disabled.");
++		}
++#endif
+ 	}
+ 
+ #ifdef ENABLE_NATPMP
+@@ -1315,6 +1331,13 @@ main(int argc, char * * argv)
+ 		{
+ 			FD_SET(sudp, &readset);
+ 			max_fd = MAX( max_fd, sudp);
++#ifdef USE_IFACEWATCHER
++			if (sifacewatcher >= 0)
++			{
++				FD_SET(sifacewatcher, &readset);
++				max_fd = MAX(max_fd, sifacewatcher);
++			}
++#endif
+ 		}
+ 		
+ 		if (shttpl >= 0) 
+@@ -1452,6 +1475,11 @@ main(int argc, char * * argv)
+ 			/*syslog(LOG_INFO, "Received UDP Packet");*/
+ 			ProcessSSDPRequest(sudp, (unsigned short)v.port);
+ 		}
++#ifdef USE_IFACEWATCHER
++		/* process kernel notifications */
++		if (sifacewatcher >= 0 && FD_ISSET(sifacewatcher, &readset))
++			ProcessInterfaceWatchNotify(sifacewatcher);
++#endif
+ 		/* process active HTTP connections */
+ 		/* LIST_FOREACH macro is not available under linux */
+ 		for(e = upnphttphead.lh_first; e != NULL; e = e->entries.le_next)
+-- 
+1.7.0.4
+

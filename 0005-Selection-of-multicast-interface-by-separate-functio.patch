@@ -1,0 +1,141 @@
+From 9d0e3e4ea7cedb2ed52fe9a843a108922d748204 Mon Sep 17 00:00:00 2001
+From: Alexey Osipov <simba@lerlan.ru>
+Date: Mon, 2 May 2011 23:26:14 +0700
+Subject: [PATCH 5/6] Selection of multicast interface by separate function.
+ Set correct multicast interface before sending NAT-PMP public address change notify.
+
+---
+ getifaddr.c |   36 ++++++++++++++++++++++++++++++++++++
+ getifaddr.h |    7 +++++++
+ minissdp.c  |   30 ++++--------------------------
+ natpmp.c    |    4 ++++
+ 4 files changed, 51 insertions(+), 26 deletions(-)
+
+diff --git a/getifaddr.c b/getifaddr.c
+index 983206e..b9f7ae3 100644
+--- a/getifaddr.c
++++ b/getifaddr.c
+@@ -132,3 +132,39 @@ getifs()
+ 
+ 	return ifs;
+ }
++
++int
++setmulticastif(int s, struct iface_s * iface)
++{
++	struct ip_mreqn mc_if;
++	struct in_addr mc_addr;
++
++	if (iface->index <= 0)
++	{
++		syslog(LOG_WARNING, "%s: iface index (%d) <= 0, falling back to IP_MULTICAST_IF by IP address only", iface->name, iface->index);
++		memset(&mc_addr, 0, sizeof(mc_addr));
++		mc_addr.s_addr = iface->addr.s_addr;
++
++		if(setsockopt(s, IPPROTO_IP, IP_MULTICAST_IF, (char *)&mc_addr, sizeof(mc_addr)) < 0)
++		{
++			syslog(LOG_ERR, "setsockopt(s, IP_MULTICAST_IF, &mc_addr): %m");
++			close(s);
++			return -1;
++		}
++	}
++	else
++	{
++		memset(&mc_if, 0, sizeof(mc_if));
++		mc_if.imr_ifindex = iface->index;
++		mc_if.imr_address = iface->addr;
++
++		if(setsockopt(s, IPPROTO_IP, IP_MULTICAST_IF, (char *)&mc_if, sizeof(mc_if)) < 0)
++		{
++			syslog(LOG_ERR, "setsockopt(s, IP_MULTICAST_IF, &mc_if): %m");
++			close(s);
++			return -1;
++		}
++	}
++
++	return 0;
++}
+diff --git a/getifaddr.h b/getifaddr.h
+index cf26f12..ce56a1f 100644
+--- a/getifaddr.h
++++ b/getifaddr.h
+@@ -24,5 +24,12 @@ getifaddr(const char * ifname, char * buf, int len);
+ struct iface_s *
+ getifs();
+ 
++/*
++ * setmulticastif()
++ * set multicast interface for specified socket to iface
++ * returns: 0 success, -1 failure */
++int
++setmulticastif(int s, struct iface_s * iface);
++
+ #endif
+ 
+diff --git a/minissdp.c b/minissdp.c
+index 0f77fff..70661b3 100644
+--- a/minissdp.c
++++ b/minissdp.c
+@@ -122,8 +122,6 @@ OpenAndConfSSDPNotifySocket(struct lan_iface_s * lan_iface)
+ 	int s;
+ 	unsigned char loopchar = 0;
+ 	int bcast = 1;
+-	struct ip_mreqn mc_if;
+-	struct in_addr mc_addr;
+ 	struct sockaddr_in sockname;
+ 
+ 	if((s = socket(PF_INET, SOCK_DGRAM, 0)) < 0)
+@@ -132,31 +130,11 @@ OpenAndConfSSDPNotifySocket(struct lan_iface_s * lan_iface)
+ 		return -1;
+ 	}
+ 
+-	memset(&mc_if, 0, sizeof(mc_if));
+-	mc_if.imr_ifindex = lan_iface->iface.index;
+-
+-	if (mc_if.imr_ifindex <= 0)
++	if(setmulticastif(s, &lan_iface->iface) < 0)
+ 	{
+-		syslog(LOG_WARNING, "%s: iface index (%d) <= 0, falling back to IP_MULTICAST_IF by IP address only", lan_iface->iface.name, mc_if.imr_ifindex);
+-		memset(&mc_addr, 0, sizeof(mc_addr));
+-		mc_addr.s_addr = lan_iface->lan_addr->addr.s_addr;
+-
+-		if(setsockopt(s, IPPROTO_IP, IP_MULTICAST_IF, (char *)&mc_addr, sizeof(mc_addr)) < 0)
+-		{
+-			syslog(LOG_ERR, "setsockopt(udp_notify, IP_MULTICAST_IF): %m");
+-			close(s);
+-			return -1;
+-		}
+-	}
+-	else
+-	{
+-		mc_if.imr_address = lan_iface->lan_addr->addr;
+-		if(setsockopt(s, IPPROTO_IP, IP_MULTICAST_IF, (char *)&mc_if, sizeof(mc_if)) < 0)
+-		{
+-			syslog(LOG_ERR, "setsockopt(udp_notify, IP_MULTICAST_IF): %m");
+-			close(s);
+-			return -1;
+-		}
++		syslog(LOG_ERR, "setmulticastif(s, &lan_iface->iface) failed");
++		close(s);
++		return -1;
+ 	}
+ 
+ 	if(setsockopt(s, IPPROTO_IP, IP_MULTICAST_LOOP, (char *)&loopchar, sizeof(loopchar)) < 0)
+diff --git a/natpmp.c b/natpmp.c
+index f53586c..4f9811a 100644
+--- a/natpmp.c
++++ b/natpmp.c
+@@ -384,6 +384,10 @@ void SendNATPMPPublicAddressChangeNotification()
+ #ifdef MULTIPLE_EXTERNAL_IP
+ 		FillPublicAddressResponse(notif, lan_iface->lan_addr->addr.s_addr);
+ #endif
++
++		if (setmulticastif(lan_iface->snatpmp, &lan_iface->iface) < 0)
++			syslog(LOG_WARNING, "%s: setmulticastif(lan_iface->snatpmp, &lan_iface->iface) failed", lan_iface->iface.name);
++
+ 		n = sendto(lan_iface->snatpmp, notif, 12, 0,
+ 		           (struct sockaddr *)&sockname, sizeof(struct sockaddr_in));
+ 		if(n < 0)
+-- 
+1.7.0.4
+

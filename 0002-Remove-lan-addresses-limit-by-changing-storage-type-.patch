@@ -1,0 +1,470 @@
+From 004ca2ccb3fe87b7622cbab90994b7718e1bde7d Mon Sep 17 00:00:00 2001
+From: Alexey Osipov <simba@lerlan.ru>
+Date: Mon, 2 May 2011 22:04:41 +0700
+Subject: [PATCH 2/6] Remove lan addresses limit by changing storage type from static array to linked list.
+
+---
+ minissdp.c       |   49 +++++++++++++------------
+ miniupnpd.c      |  103 ++++++++++++++++++++++++++++++++---------------------
+ miniupnpdtypes.h |    5 ++-
+ natpmp.c         |   13 +++++--
+ upnpglobalvars.c |    3 +-
+ upnpglobalvars.h |    9 ++---
+ 6 files changed, 106 insertions(+), 76 deletions(-)
+
+diff --git a/minissdp.c b/minissdp.c
+index 0363785..b23ff20 100644
+--- a/minissdp.c
++++ b/minissdp.c
+@@ -54,10 +54,10 @@ int
+ OpenAndConfSSDPReceiveSocket()
+ {
+ 	int s;
+-	int i;
+-	int j = 1;
+ 	struct sockaddr_in sockname;
+-	
++	struct lan_addr_s * lan_addr;
++	int j = 1;
++
+ 	if( (s = socket(PF_INET, SOCK_DGRAM, 0)) < 0)
+ 	{
+ 		syslog(LOG_ERR, "socket(udp): %m");
+@@ -85,15 +85,13 @@ OpenAndConfSSDPReceiveSocket()
+ 		return -1;
+ 	}
+ 
+-	i = n_lan_addr;
+-	while(i>0)
++	for(lan_addr = lan_addrs.lh_first; lan_addr != NULL; lan_addr = lan_addr->list.le_next)
+ 	{
+-		i--;
+-		if(AddMulticastMembership(s, lan_addr[i].addr.s_addr) < 0)
++		if(AddMulticastMembership(s, lan_addr->addr.s_addr) < 0)
+ 		{
+ 			syslog(LOG_WARNING,
+-			       "Failed to add multicast membership for address %s", 
+-			       lan_addr[i].str );
++			       "Failed to add multicast membership for interface %s", 
++			       lan_addr->str);
+ 		}
+ 	}
+ 
+@@ -160,9 +158,11 @@ OpenAndConfSSDPNotifySockets(int * sockets)
+                              struct lan_addr_s * lan_addr, int n_lan_addr)*/
+ {
+ 	int i, j;
+-	for(i=0; i<n_lan_addr; i++)
++	struct lan_addr_s * lan_addr;
++
++	for(i=0, lan_addr = lan_addrs.lh_first; lan_addr != NULL; lan_addr = lan_addr->list.le_next, i++)
+ 	{
+-		sockets[i] = OpenAndConfSSDPNotifySocket(lan_addr[i].addr.s_addr);
++		sockets[i] = OpenAndConfSSDPNotifySocket(lan_addr->addr.s_addr);
+ 		if(sockets[i] < 0)
+ 		{
+ 			for(j=0; j<i; j++)
+@@ -302,9 +302,10 @@ SendSSDPNotifies2(int * sockets,
+                   unsigned int lifetime)
+ {
+ 	int i;
+-	for(i=0; i<n_lan_addr; i++)
++	struct lan_addr_s * lan_addr;
++	for(i=0, lan_addr = lan_addrs.lh_first; lan_addr != NULL; lan_addr = lan_addr->list.le_next, i++)
+ 	{
+-		SendSSDPNotifies(sockets[i], lan_addr[i].str, port, lifetime);
++		SendSSDPNotifies(sockets[i], lan_addr->str, port, lifetime);
+ 	}
+ }
+ 
+@@ -332,7 +333,7 @@ ProcessSSDPRequest(int s, unsigned short port)
+ 
+ void ProcessSSDPData(int s, char *bufr, struct sockaddr_in sendername, int n, unsigned short port) {
+ 	int i, l;
+-	int lan_addr_index = 0;
++	struct lan_addr_s * lan_addr = NULL;
+ 	char * st = 0;
+ 	int st_len = 0;
+ 
+@@ -376,14 +377,16 @@ void ProcessSSDPData(int s, char *bufr, struct sockaddr_in sendername, int n, un
+ 	           	   ntohs(sendername.sin_port),
+ 				   st_len, st);
+ 			/* find in which sub network the client is */
+-			for(i = 0; i<n_lan_addr; i++)
++			for(lan_addr = lan_addrs.lh_first; lan_addr != NULL; lan_addr = lan_addr->list.le_next)
+ 			{
+-				if( (sendername.sin_addr.s_addr & lan_addr[i].mask.s_addr)
+-				   == (lan_addr[i].addr.s_addr & lan_addr[i].mask.s_addr))
+-				{
+-					lan_addr_index = i;
++				if( (sendername.sin_addr.s_addr & lan_addr->mask.s_addr)
++				   == (lan_addr->addr.s_addr & lan_addr->mask.s_addr))
+ 					break;
+-				}
++			}
++			if (lan_addr == NULL)
++			{
++				syslog(LOG_ERR, "Can't find in which sub network the client is");
++				return;
+ 			}
+ 			/* Responds to request with a device as ST header */
+ 			for(i = 0; known_service_types[i]; i++)
+@@ -394,7 +397,7 @@ void ProcessSSDPData(int s, char *bufr, struct sockaddr_in sendername, int n, un
+ 					syslog(LOG_INFO, "Single search found");
+ 					SendSSDPAnnounce2(s, sendername,
+ 					                  st, st_len, "",
+-					                  lan_addr[lan_addr_index].str, port);
++					                  lan_addr->str, port);
+ 					break;
+ 				}
+ 			}
+@@ -408,7 +411,7 @@ void ProcessSSDPData(int s, char *bufr, struct sockaddr_in sendername, int n, un
+ 					l = (int)strlen(known_service_types[i]);
+ 					SendSSDPAnnounce2(s, sendername,
+ 					                  known_service_types[i], l, i==0?"":"1",
+-					                  lan_addr[lan_addr_index].str, port);
++					                  lan_addr->str, port);
+ 				}
+ 			}
+ 			/* responds to request by UUID value */
+@@ -417,7 +420,7 @@ void ProcessSSDPData(int s, char *bufr, struct sockaddr_in sendername, int n, un
+ 			{
+ 				syslog(LOG_INFO, "ssdp:uuid found");
+ 				SendSSDPAnnounce2(s, sendername, st, st_len, "",
+-				                  lan_addr[lan_addr_index].str, port);
++				                  lan_addr->str, port);
+ 			}
+ 		}
+ 		else
+diff --git a/miniupnpd.c b/miniupnpd.c
+index b0073da..bdf44f8 100644
+--- a/miniupnpd.c
++++ b/miniupnpd.c
+@@ -557,6 +557,8 @@ init(int argc, char * * argv, struct runtime_vars * v)
+ 	/*const char * logfilename = 0;*/
+ 	const char * presurl = 0;
+ 	const char * optionsfile = DEFAULT_CONFIG;
++	struct lan_addr_s * lan_addr;
++	struct lan_addr_s * lan_addr2;
+ 
+ 	/* only print usage if -h is used */
+ 	for(i=1; i<argc; i++)
+@@ -578,7 +580,7 @@ init(int argc, char * * argv, struct runtime_vars * v)
+ 	/* set initial values */
+ 	SETFLAG(ENABLEUPNPMASK);
+ 
+-	/*v->n_lan_addr = 0;*/
++	LIST_INIT(&lan_addrs);
+ 	v->port = -1;
+ 	v->notify_interval = 30;	/* seconds between SSDP announces */
+ 	v->clean_ruleset_threshold = 20;
+@@ -605,18 +607,19 @@ init(int argc, char * * argv, struct runtime_vars * v)
+ 				use_ext_ip_addr = ary_options[i].value;
+ 				break;
+ 			case UPNPLISTENING_IP:
+-				if(n_lan_addr < MAX_LAN_ADDR)/* if(v->n_lan_addr < MAX_LAN_ADDR)*/
++				lan_addr = (struct lan_addr_s *) malloc(sizeof(struct lan_addr_s));
++				if (lan_addr == NULL)
+ 				{
+-					/*if(parselanaddr(&v->lan_addr[v->n_lan_addr],*/
+-					if(parselanaddr(&lan_addr[n_lan_addr],
+-					             ary_options[i].value) == 0)
+-						n_lan_addr++; /*v->n_lan_addr++; */
++					fprintf(stderr, "malloc(sizeof(struct lan_addr_s)): %m");
++					break;
+ 				}
+-				else
++				if(parselanaddr(lan_addr, ary_options[i].value) != 0)
+ 				{
+-					fprintf(stderr, "Too many listening ips (max: %d), ignoring %s\n",
+-			    		    MAX_LAN_ADDR, ary_options[i].value);
++					fprintf(stderr, "can't parse \"%s\" as valid lan address\n", ary_options[i].value);
++					free(lan_addr);
++					break;
+ 				}
++				LIST_INSERT_HEAD(&lan_addrs, lan_addr, list);
+ 				break;
+ 			case UPNPPORT:
+ 				v->port = atoi(ary_options[i].value);
+@@ -850,28 +853,27 @@ init(int argc, char * * argv, struct runtime_vars * v)
+ 		case 'a':
+ 			if(i+1 < argc)
+ 			{
+-				int address_already_there = 0;
+-				int j;
+ 				i++;
+-				for(j=0; j<n_lan_addr; j++)
++				lan_addr = (struct lan_addr_s *) malloc(sizeof(struct lan_addr_s));
++				if (lan_addr == NULL)
+ 				{
+-					struct lan_addr_s tmpaddr;
+-					parselanaddr(&tmpaddr, argv[i]);
+-					if(0 == strcmp(lan_addr[j].str, tmpaddr.str))
+-						address_already_there = 1;
+-				}
+-				if(address_already_there)
++					fprintf(stderr, "malloc(sizeof(struct lan_addr_s)): %m");
+ 					break;
+-				if(n_lan_addr < MAX_LAN_ADDR)
++				}
++				if(parselanaddr(lan_addr, argv[i]) != 0)
+ 				{
+-					if(parselanaddr(&lan_addr[n_lan_addr], argv[i]) == 0)
+-						n_lan_addr++;
++					fprintf(stderr, "can't parse \"%s\" as valid lan address\n", argv[i]);
++					free(lan_addr);
++					break;
+ 				}
+-				else
++				/* check if we already have this address */
++				for(lan_addr2 = lan_addrs.lh_first; lan_addr2 != NULL; lan_addr2 = lan_addr2->list.le_next)
+ 				{
+-					fprintf(stderr, "Too many listening ips (max: %d), ignoring %s\n",
+-				    	    MAX_LAN_ADDR, argv[i]);
++					if (0 == strncmp(lan_addr2->str, lan_addr->str, 15))
++						break;
+ 				}
++				if (lan_addr2 == NULL)
++					LIST_INSERT_HEAD(&lan_addrs, lan_addr, list);
+ 			}
+ 			else
+ 				fprintf(stderr, "Option -%c takes one argument.\n", argv[i][1]);
+@@ -883,7 +885,7 @@ init(int argc, char * * argv, struct runtime_vars * v)
+ 			fprintf(stderr, "Unknown option: %s\n", argv[i]);
+ 		}
+ 	}
+-	if(!ext_if_name || (n_lan_addr==0))
++	if(!ext_if_name || !lan_addrs.lh_first)
+ 	{
+ 		/* bad configuration */
+ 		goto print_usage;
+@@ -936,8 +938,8 @@ init(int argc, char * * argv, struct runtime_vars * v)
+ 	else
+ 	{
+ 		snprintf(presentationurl, PRESENTATIONURL_MAX_LEN,
+-		         "http://%s/", lan_addr[0].str);
+-		         /*"http://%s:%d/", lan_addr[0].str, 80);*/
++		         "http://%s/", lan_addrs.lh_first->str);
++		         /*"http://%s:%d/", lan_addrs.lh_first->str, 80);*/
+ 	}
+ 
+ 	/* set signal handler */
+@@ -1033,12 +1035,13 @@ main(int argc, char * * argv)
+ 	int i;
+ 	int shttpl = -1;
+ #ifdef ENABLE_NATPMP
+-	int snatpmp[MAX_LAN_ADDR];
++	int * snatpmp;
+ #ifdef ENABLE_NFQUEUE
+ 	int nfqh = -1;
+ #endif
+ #endif
+-	int snotify[MAX_LAN_ADDR];
++	int * snotify;
++	int addr_count;
+ 	LIST_HEAD(httplisthead, upnphttp) upnphttphead;
+ 	struct upnphttp * e = 0;
+ 	struct upnphttp * next;
+@@ -1058,16 +1061,22 @@ main(int argc, char * * argv)
+ 	/* variables used for the unused-rule cleanup process */
+ 	struct rule_state * rule_list = 0;
+ 	struct timeval checktime = {0, 0};
++	struct lan_addr_s * lan_addr;
+ 	syslog(LOG_INFO, "SNet version started");
+ 
+-
++	if(init(argc, argv, &v) != 0)
++		return 1;
++	/* count lan addrs */
++	addr_count = 0;
++	for(lan_addr = lan_addrs.lh_first; lan_addr != NULL; lan_addr = lan_addr->list.le_next)
++		addr_count++;
++	snotify = (int*) malloc(addr_count * sizeof(int));
+ 	memset(snotify, 0, sizeof(snotify));
+ #ifdef ENABLE_NATPMP
+-	for(i = 0; i < MAX_LAN_ADDR; i++)
++	snatpmp = (int*) malloc(addr_count * sizeof(int));
++	for(i = 0; i < addr_count; i++)
+ 		snatpmp[i] = -1;
+ #endif
+-	if(init(argc, argv, &v) != 0)
+-		return 1;
+ 
+ 	LIST_INIT(&upnphttphead);
+ #ifdef USE_MINIUPNPDCTL
+@@ -1105,11 +1114,11 @@ main(int argc, char * * argv)
+ 		syslog(LOG_NOTICE, "HTTP listening on port %d", v.port);
+ 
+ 		/* open socket for SSDP connections */
+-		sudp = OpenAndConfSSDPReceiveSocket(n_lan_addr, lan_addr);
++		sudp = OpenAndConfSSDPReceiveSocket();
+ 		if(sudp < 0)
+ 		{
+ 			syslog(LOG_INFO, "Failed to open socket for receiving SSDP. Trying to use MiniSSDPd");
+-			if(SubmitServicesToMiniSSDPD(lan_addr[0].str, v.port) < 0) {
++			if(SubmitServicesToMiniSSDPD(lan_addrs.lh_first->str, v.port) < 0) {
+ 				syslog(LOG_ERR, "Failed to connect to MiniSSDPd. EXITING");
+ 				return 1;
+ 			}
+@@ -1274,7 +1283,7 @@ main(int argc, char * * argv)
+ 		}
+ #endif
+ #ifdef ENABLE_NATPMP
+-		for(i=0; i<n_lan_addr; i++) {
++		for(i=0; i<addr_count; i++) {
+ 			if(snatpmp[i] >= 0) {
+ 				FD_SET(snatpmp[i], &readset);
+ 				max_fd = MAX( max_fd, snatpmp[i]);
+@@ -1371,7 +1380,7 @@ main(int argc, char * * argv)
+ #endif
+ #ifdef ENABLE_NATPMP
+ 		/* process NAT-PMP packets */
+-		for(i=0; i<n_lan_addr; i++)
++		for(i=0; i<addr_count; i++)
+ 		{
+ 			if((snatpmp[i] >= 0) && FD_ISSET(snatpmp[i], &readset))
+ 			{
+@@ -1456,7 +1465,7 @@ main(int argc, char * * argv)
+ 		{
+ #ifdef ENABLE_NATPMP
+ 			if(GETFLAG(ENABLENATPMPMASK))
+-				SendNATPMPPublicAddressChangeNotification(snatpmp/*snotify*/, n_lan_addr);
++				SendNATPMPPublicAddressChangeNotification(snatpmp/*snotify*/, addr_count);
+ #endif
+ #ifdef ENABLE_EVENTS
+ 			if(GETFLAG(ENABLEUPNPMASK))
+@@ -1480,7 +1489,7 @@ shutdown:
+ 	if (sudp >= 0) close(sudp);
+ 	if (shttpl >= 0) close(shttpl);
+ #ifdef ENABLE_NATPMP
+-	for(i=0; i<n_lan_addr; i++) {
++	for(i=0; i<addr_count; i++) {
+ 		if(snatpmp[i]>=0)
+ 		{
+ 			close(snatpmp[i]);
+@@ -1503,11 +1512,11 @@ shutdown:
+ 	/*if(SendSSDPGoodbye(snotify, v.n_lan_addr) < 0)*/
+ 	if (GETFLAG(ENABLEUPNPMASK))
+ 	{
+-		if(SendSSDPGoodbye(snotify, n_lan_addr) < 0)
++		if(SendSSDPGoodbye(snotify, addr_count) < 0)
+ 		{
+ 			syslog(LOG_ERR, "Failed to broadcast good-bye notifications");
+ 		}
+-		for(i=0; i<n_lan_addr; i++)/* for(i=0; i<v.n_lan_addr; i++)*/
++		for(i=0; i<addr_count; i++)
+ 			close(snotify[i]);
+ 	}
+ 
+@@ -1516,6 +1525,18 @@ shutdown:
+ 		syslog(LOG_ERR, "Failed to remove pidfile %s: %m", pidfilename);
+ 	}
+ 
++	/* delete lists */
++	while(lan_addrs.lh_first != NULL)
++	{
++		lan_addr = lan_addrs.lh_first;
++		LIST_REMOVE(lan_addrs.lh_first, list);
++		free(lan_addr);
++	}
++
++#ifdef ENABLE_NATPMP
++	free(snatpmp);
++#endif
++	free(snotify);
+ 	closelog();	
+ 	freeoptions();
+ 	
+diff --git a/miniupnpdtypes.h b/miniupnpdtypes.h
+index ea44ae3..cf7b2be 100644
+--- a/miniupnpdtypes.h
++++ b/miniupnpdtypes.h
+@@ -9,8 +9,9 @@
+ 
+ #include "config.h"
+ #include <netinet/in.h>
++#include <sys/queue.h>
+ 
+-/* structure for storing lan addresses
++/* structure and list for storing lan addresses
+  * with ascii representation and mask */
+ struct lan_addr_s {
+ 	char str[16];	/* example: 192.168.0.1 */
+@@ -19,6 +20,8 @@ struct lan_addr_s {
+ 	char ext_ip_str[16];
+ 	struct in_addr ext_ip_addr;
+ #endif
++	LIST_ENTRY(lan_addr_s) list;
+ };
++LIST_HEAD(lan_addr_list, lan_addr_s);
+ 
+ #endif
+diff --git a/natpmp.c b/natpmp.c
+index b0addfe..c9195ca 100644
+--- a/natpmp.c
++++ b/natpmp.c
+@@ -53,9 +53,10 @@ int OpenAndConfNATPMPSocket(in_addr_t addr)
+ int OpenAndConfNATPMPSockets(int * sockets)
+ {
+ 	int i, j;
+-	for(i=0; i<n_lan_addr; i++)
++	struct lan_addr_s * lan_addr;
++	for(i = 0, lan_addr = lan_addrs.lh_first; lan_addr != NULL; lan_addr = lan_addr->list.le_next, i++)
+ 	{
+-		sockets[i] = OpenAndConfNATPMPSocket(lan_addr[i].addr.s_addr);
++		sockets[i] = OpenAndConfNATPMPSocket(lan_addr->addr.s_addr);
+ 		if(sockets[i] < 0)
+ 		{
+ 			for(j=0; j<i; j++)
+@@ -366,7 +367,13 @@ void SendNATPMPPublicAddressChangeNotification(int * sockets, int n_sockets)
+ 		if(sockets[j] < 0)
+ 			continue;
+ #ifdef MULTIPLE_EXTERNAL_IP
+-		FillPublicAddressResponse(notif, lan_addr[j].addr.s_addr);
++		{
++			struct lan_addr_s * lan_addr = lan_addrs.lh_first;
++			int i;
++			for(i=0; i<j; i++)
++				lan_addr = lan_addr->list.le_next;
++			FillPublicAddressResponse(notif, lan_addr->addr.s_addr);
++		}
+ #endif
+ 		n = sendto(sockets[j], notif, 12, 0,
+ 		           (struct sockaddr *)&sockname, sizeof(struct sockaddr_in));
+diff --git a/upnpglobalvars.c b/upnpglobalvars.c
+index 0402aa2..28afd6e 100644
+--- a/upnpglobalvars.c
++++ b/upnpglobalvars.c
+@@ -84,8 +84,7 @@ int nfqueue = -1;
+ int n_nfqix = 0;
+ unsigned nfqix[MAX_LAN_ADDR];
+ #endif
+-int n_lan_addr = 0;
+-struct lan_addr_s lan_addr[MAX_LAN_ADDR];
++struct lan_addr_list lan_addrs;
+ 
+ /* Path of the Unix socket used to communicate with MiniSSDPd */
+ const char * minissdpdsocketpath = "/var/run/minissdpd.sock";
+diff --git a/upnpglobalvars.h b/upnpglobalvars.h
+index 30b5a20..e3c580a 100644
+--- a/upnpglobalvars.h
++++ b/upnpglobalvars.h
+@@ -92,12 +92,9 @@ extern int nfqueue;
+ extern int n_nfqix;
+ extern unsigned nfqix[];
+ #endif
+-/* lan addresses */
+-/* MAX_LAN_ADDR : maximum number of interfaces
+- * to listen to SSDP traffic */
+-#define MAX_LAN_ADDR (4)
+-extern int n_lan_addr;
+-extern struct lan_addr_s lan_addr[];
++
++/* lan addresses to listen to SSDP traffic */
++extern struct lan_addr_list lan_addrs;
+ 
+ extern const char * minissdpdsocketpath;
+ 
+-- 
+1.7.0.4
+
